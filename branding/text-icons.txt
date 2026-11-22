@@ -1,0 +1,38 @@
+hum — a tiny Plex audio player for your terminal
+Command: hum
+
+One-line icons
+--------------
+>)))
+▸)))
+[>)))]
+>hum
+
+Boxed icon
+----------
+╭──────────╮
+│ >  ) ) ) │
+│ hum_     │
+╰──────────╯
+
+Splash banner
+-------------
+\       _
+ \     | |__  _   _ _ __ ___
+  > )))| '_ \| | | | '_ ` _ \
+ /     | | | | |_| | | | | | |
+/      |_| |_|\__,_|_| |_| |_|
+
+Status line
+-----------
+>))) hum  ▶ [Artist] — [Track]   02:14 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 05:29  vol 70%
+
+Palette
+-------
+Ink       #0E1116
+Panel     #161B22
+Amber     #F2A93B
+Amber-dk  #B8700A   (light-background variant)
+Fog       #C9D1D9
+Mute      #8B949E
+Light bg  #F6F4EF
