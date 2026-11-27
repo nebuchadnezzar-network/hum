@@ -429,7 +429,7 @@ final class HumApp {
 
                 events.post(.connected(server, sections))
             } catch {
-                events.post(.status(error.localizedDescription, isError: true))
+                events.post(.connectionFailed(error.localizedDescription))
             }
         }
     }

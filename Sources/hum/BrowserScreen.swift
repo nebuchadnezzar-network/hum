@@ -78,6 +78,7 @@ final class BrowserScreen {
     private var scope = ScopeMeter()
     private let artwork: ArtworkLoader
     private var isConnecting = true
+    private var connection: ConnectionStatus = .connecting
     private var running = true
 
     /// Target frame rate while something is playing and a visualisation is up.
@@ -291,6 +292,11 @@ final class BrowserScreen {
         case .status(let message, let isError):
             setStatus(message, isError: isError)
 
+        case .connectionFailed(let reason):
+            isConnecting = false
+            connection = .offline
+            setStatus(reason, isError: true)
+
         case .connected(let server, let sections):
             isConnecting = false
             guard !sections.isEmpty else {
@@ -298,7 +304,8 @@ final class BrowserScreen {
                 return
             }
             let route = server.isRelay ? "relay" : (server.isLocal ? "local" : "remote")
-            setStatus("\(server.name) · \(route)", isError: false)
+            connection = .online(route: route, name: server.name)
+            setStatus(connection.detailedLabel, isError: false)
             section = app.preferredSection
             if let section {
                 app.rememberSection(section)
@@ -1735,6 +1742,23 @@ final class BrowserScreen {
         x += screen.put(">)))", x: x, y: rect.minY, style: base.fg(Palette.amber).with(.bold))
         x += 1
         x += screen.put("hum", x: x, y: rect.minY, style: base.fg(Palette.fog).with(.bold))
+        x += 1
+        x += screen.put(humVersion, x: x, y: rect.minY, style: base.fg(Palette.mute))
+        x += 2
+
+        // Server status. The name as well as the route where it fits, because
+        // "local" alone does not say *which* server on an account with more
+        // than one.
+        let statusStyle = base.fg(connection.color)
+        x += screen.put(connection.glyph, x: x, y: rect.minY, style: statusStyle)
+        x += 1
+        let roomy = rect.width >= 100
+        x += screen.put(
+            roomy ? connection.detailedLabel : connection.label,
+            x: x,
+            y: rect.minY,
+            style: base.fg(Palette.mute)
+        )
         x += 2
 
         if showFrameRate {
@@ -1751,7 +1775,6 @@ final class BrowserScreen {
             ("m", mode.next.title),
             ("V", visualization.next.title),
             ("z", "viz"),
-            ("v", "window"),
             ("L", "lyrics"),
             ("0–5", "rate"),
             ("?", "keys"),

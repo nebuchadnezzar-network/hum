@@ -12,6 +12,9 @@ enum Event {
     case playback(PlaybackState)
     case status(String, isError: Bool)
     case connected(PlexServer, [LibrarySection])
+    /// Connecting failed. Distinct from `.status`, which carries every other
+    /// kind of error and cannot drive an indicator.
+    case connectionFailed(String)
     case sectionLoaded(sectionID: String, collections: [CollectionItem])
     /// A further page of the collection list, appended to what is already shown.
     case sectionPageLoaded(sectionID: String, collections: [CollectionItem], total: Int)

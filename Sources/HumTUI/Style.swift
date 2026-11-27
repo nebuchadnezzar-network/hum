@@ -39,6 +39,12 @@ public enum Palette {
     public static let mute = Color(hex: 0x8B949E)
     public static let lightBackground = Color(hex: 0xF6F4EF)
 
+    /// Connected. Deliberately outside the amber-and-grey palette: a status
+    /// light is read at a glance and from across a desk, and green is what
+    /// "working" means everywhere else. Looking consistent is not worth being
+    /// slower to read.
+    public static let online = Color(hex: 0x3FB950)
+
     /// Panel borders sit between panel and mute so they recede behind content.
     public static let border = Color(hex: 0x161B22).mix(Color(hex: 0x8B949E), 0.45)
 }
