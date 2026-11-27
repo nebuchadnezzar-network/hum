@@ -74,6 +74,8 @@ enum CLI {
           hum demo            browse a fake library (no Plex account needed)
           hum artwork [query] dump the cover-art pipeline to ~/hum-artwork-report
           hum lyrics  [query] check what the server holds for lyrics
+          hum tags            check which tag facets this server supports
+          hum stream  [query] find out why a track will not play
           hum version         print the version
           hum help            this text
 

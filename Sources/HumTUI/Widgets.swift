@@ -116,14 +116,25 @@ public struct ListView {
     public var rows: [Row]
     public var selected: Int
     public var isFocused: Bool
+    /// Shown instead of the rows when there are none. "nothing here" is the
+    /// honest answer only when nothing could be there; a pane waiting on a
+    /// selection should say so instead.
+    public var emptyMessage: String
     /// Scroll offset, updated in place by `draw` so the selection stays visible.
     public var offset: Int
 
-    public init(rows: [Row], selected: Int = 0, isFocused: Bool = false, offset: Int = 0) {
+    public init(
+        rows: [Row],
+        selected: Int = 0,
+        isFocused: Bool = false,
+        offset: Int = 0,
+        emptyMessage: String = "nothing here"
+    ) {
         self.rows = rows
         self.selected = selected
         self.isFocused = isFocused
         self.offset = offset
+        self.emptyMessage = emptyMessage
     }
 
     /// Clamps `offset` so `selected` is on screen. Call before `draw` and persist
@@ -145,7 +156,7 @@ public struct ListView {
 
         if rows.isEmpty {
             screen.putTruncated(
-                "nothing here",
+                emptyMessage,
                 x: rect.minX + 1,
                 y: rect.minY,
                 style: Style(fg: Palette.mute, bg: Palette.ink).with(.italic),

@@ -19,7 +19,12 @@ final class BrowserScreen {
         case none
         case help
         case search(String)
+        /// Choosing a playlist to add the pending item to.
+        case playlists([CollectionItem], selected: Int)
     }
+
+    /// What `a` is about to add, and how to describe it once added.
+    private var pendingAdd: (ratingKey: String, label: String)?
 
     private let app: HumApp
     private let terminal: Terminal
@@ -353,6 +358,50 @@ final class BrowserScreen {
             lyricsScroll = 0
 
 
+        case .playlistChoices(let playlists):
+            // Dropped if the reader cancelled while the request was in flight,
+            // so a late response cannot reopen an overlay they dismissed.
+            guard pendingAdd != nil else { return }
+            overlay = .playlists(playlists, selected: 0)
+
+        case .shuffleAll(let mix, let replacing):
+            if replacing {
+                searchQuery = nil
+                tracks = mix
+                selection[Pane.tracks.rawValue] = 0
+                offsets[Pane.tracks.rawValue] = 0
+                focus = .tracks
+                subject.listsReplaced(landedOnTrackList: true)
+                app.play(mix, startingAt: 0)
+                // play() clears the shuffle-all flag, since choosing something
+                // is normally how you leave the mix. Set it going again.
+                if let section = section { app.resumeShuffleAll(section: section) }
+                setStatus("shuffling \(mix.count) tracks from the library", isError: false)
+            } else {
+                // A top-up: the queue grows behind what is playing, so the pane
+                // has to grow with it or the two disagree about track numbers.
+                tracks.append(contentsOf: mix)
+                app.enqueue(mix)
+            }
+
+        case .landed(let landing):
+            // Clears any search: the landing replaces what the panes describe,
+            // and leaving "albums · results" in the titles would label it as a
+            // search result.
+            searchQuery = nil
+            mode = landing.mode
+            collections = landing.collections
+            albums = landing.albums
+            tracks = landing.tracks
+            selection = [landing.collectionIndex, landing.albumIndex ?? 0, landing.trackIndex]
+            offsets = [0, 0, 0]
+            focus = .tracks
+            // The cursor is on the track that is about to play, so it is also
+            // what the panes should describe.
+            subject.listsReplaced(landedOnTrackList: true)
+            app.play(landing.tracks, startingAt: landing.trackIndex)
+            setStatus(landing.describedChoice, isError: false)
+
         case .searchResults(let query, let results):
             guard !results.isEmpty else {
                 setStatus("Nothing found for “\(query)”.", isError: false)
@@ -540,6 +589,9 @@ final class BrowserScreen {
             // Any key dismisses the cheat sheet.
             overlay = .none
             return
+        case .playlists(let playlists, let selected):
+            handlePlaylistKey(key, playlists: playlists, selected: selected)
+            return
         case .none:
             break
         }
@@ -645,8 +697,22 @@ final class BrowserScreen {
         case .character("m"):
             cycleMode()
 
-        case .character("v"):
-            app.toggleVisualizer()
+        case .character("X"):
+            if let section = section {
+                app.shuffleAll(section: section)
+            } else {
+                setStatus("no library yet", isError: true)
+            }
+
+        case .character("x"):
+            // Not `r` or `R`: `r` is repeat, and a mis-shifted keystroke that
+            // abandoned what you were browsing and started unrelated music
+            // would be a worse bug than an unmemorable binding.
+            if let section = section {
+                app.surpriseMe(section: section)
+            } else {
+                setStatus("no library yet", isError: true)
+            }
 
         case .character("V"):
             visualization = visualization.next
@@ -701,6 +767,9 @@ final class BrowserScreen {
         // routinely swallow it before the application ever sees it.
         case .character("S"):
             saveSnapshot()
+
+        case .character("a"):
+            beginAddToPlaylist()
 
         case .character("?"):
             overlay = .help
@@ -939,6 +1008,9 @@ final class BrowserScreen {
         }
         if case .search(let query) = overlay {
             drawSearchPrompt(in: statusRect, query: query)
+        }
+        if case .playlists(let playlists, let selected) = overlay {
+            drawPlaylistOverlay(playlists, selected: selected)
         }
 
         flush()
@@ -1207,7 +1279,8 @@ final class BrowserScreen {
             rows: collections.map { ListView.Row(text: $0.title, detail: showDetail ? $0.detail : nil) },
             selected: selection[Pane.collections.rawValue],
             isFocused: focus == .collections,
-            offset: offsets[Pane.collections.rawValue]
+            offset: offsets[Pane.collections.rawValue],
+            emptyMessage: mode.collectionsEmptyMessage
         )
         list.scrollToSelection(viewportHeight: inner.height)
         offsets[Pane.collections.rawValue] = list.offset
@@ -1229,7 +1302,11 @@ final class BrowserScreen {
             },
             selected: selection[Pane.albums.rawValue],
             isFocused: focus == .albums,
-            offset: offsets[Pane.albums.rawValue]
+            offset: offsets[Pane.albums.rawValue],
+            emptyMessage: mode.albumsEmptyMessage(
+                hasCollections: !collections.isEmpty,
+                isSearching: searchQuery != nil
+            )
         )
         list.scrollToSelection(viewportHeight: inner.height)
         offsets[Pane.albums.rawValue] = list.offset
@@ -1293,7 +1370,12 @@ final class BrowserScreen {
             },
             selected: selection[Pane.tracks.rawValue],
             isFocused: focus == .tracks,
-            offset: offsets[Pane.tracks.rawValue]
+            offset: offsets[Pane.tracks.rawValue],
+            emptyMessage: mode.tracksEmptyMessage(
+                hasCollections: !collections.isEmpty,
+                hasAlbums: !albums.isEmpty,
+                isSearching: searchQuery != nil
+            )
         )
         list.scrollToSelection(viewportHeight: inner.height)
         offsets[Pane.tracks.rawValue] = list.offset
@@ -1855,6 +1937,111 @@ final class BrowserScreen {
         screen.put("▏", x: x, y: rect.minY, style: Style(fg: Palette.amber, bg: Palette.ink).with(.bold))
     }
 
+    /// What the cursor is pointing at, as something a playlist can hold.
+    ///
+    /// A playlist takes any of the three: the server expands an album or an
+    /// artist into its tracks. The facet panes are the exception — a genre is
+    /// not an item, so there is nothing to add.
+    private func addableSelection() -> (ratingKey: String, label: String)? {
+        switch focus {
+        case .tracks:
+            let index = selection[Pane.tracks.rawValue]
+            guard tracks.indices.contains(index) else { return nil }
+            return (tracks[index].id, "“\(tracks[index].title)”")
+        case .albums:
+            let index = selection[Pane.albums.rawValue]
+            guard albums.indices.contains(index) else { return nil }
+            return (albums[index].id, "the album “\(albums[index].title)”")
+        case .collections:
+            let index = selection[Pane.collections.rawValue]
+            guard mode == .artists, collections.indices.contains(index) else { return nil }
+            return (collections[index].id, "everything by \(collections[index].title)")
+        }
+    }
+
+    private func beginAddToPlaylist() {
+        guard section != nil else {
+            setStatus("no library yet", isError: true)
+            return
+        }
+        guard let candidate = addableSelection() else {
+            setStatus(
+                focus == .collections && mode != .artists
+                    ? "a \(mode.singular) is not something a playlist can hold"
+                    : "nothing selected to add",
+                isError: true
+            )
+            return
+        }
+        pendingAdd = candidate
+        setStatus("fetching playlists…", isError: false)
+        app.loadPlaylistChoices()
+    }
+
+    private func handlePlaylistKey(_ key: Key, playlists: [CollectionItem], selected: Int) {
+        switch key {
+        case .escape, .character("q"):
+            pendingAdd = nil
+            overlay = .none
+            setStatus("", isError: false)
+
+        case .down, .character("j"):
+            overlay = .playlists(playlists, selected: min(selected + 1, playlists.count - 1))
+
+        case .up, .character("k"):
+            overlay = .playlists(playlists, selected: max(selected - 1, 0))
+
+        case .enter:
+            defer {
+                pendingAdd = nil
+                overlay = .none
+            }
+            guard let pending = pendingAdd,
+                  let section = section,
+                  playlists.indices.contains(selected) else { return }
+            let chosen = playlists[selected]
+            app.addToPlaylist(
+                chosen.id,
+                playlistTitle: chosen.title,
+                ratingKey: pending.ratingKey,
+                describing: pending.label,
+                section: section
+            )
+
+        default:
+            break
+        }
+    }
+
+    private func drawPlaylistOverlay(_ playlists: [CollectionItem], selected: Int) {
+        let titleWidth = playlists.map { displayWidth($0.title) }.max() ?? 0
+        let width = min(screen.columns - 4, max(titleWidth + 10, 28))
+        let height = min(screen.rows - 4, playlists.count + 2)
+        let rect = Rect(
+            x: (screen.columns - width) / 2,
+            y: (screen.rows - height) / 2,
+            width: width,
+            height: height
+        )
+
+        screen.fill(rect, style: Style(fg: Palette.fog, bg: Palette.panel))
+        let inner = Panel(
+            title: pendingAdd.map { "add \($0.label)" } ?? "add to playlist",
+            isFocused: true,
+            style: Style(fg: Palette.amber, bg: Palette.panel),
+            titleStyle: Style(fg: Palette.amber, bg: Palette.panel)
+        ).draw(in: rect, on: screen)
+
+        var list = ListView(
+            rows: playlists.map { ListView.Row(text: $0.title, detail: $0.detail) },
+            selected: selected,
+            isFocused: true,
+            emptyMessage: "no playlists"
+        )
+        list.scrollToSelection(viewportHeight: inner.height)
+        list.draw(in: inner, on: screen)
+    }
+
     private func drawHelpOverlay() {
         let entries: [(String, String)] = [
             ("space", "play / pause"),
@@ -1868,11 +2055,13 @@ final class BrowserScreen {
             ("s r", "shuffle / repeat"),
             ("e", "queue selection"),
             ("m", "cycle artists / genres / styles / moods / labels"),
+            ("x", "play something at random"),
+            ("X", "shuffle the whole library, without end"),
+            ("a", "add the selection to a playlist"),
             ("/", "search the library"),
             ("L", "show or hide the lyrics strip"),
             (", .", "scroll the lyrics strip a line at a time"),
             ("< >", "page the lyrics strip (g resumes following)"),
-            ("v", "GPU visualizer window"),
             ("V", "switch spectrum / waveform"),
             ("z", "show or hide the visualisation"),
             ("esc", "close overlay or search results"),

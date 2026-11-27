@@ -76,9 +76,12 @@ synthesised on first play and cleaned up on exit.
 | `n` `p` | next / previous track |
 | `/` | search |
 | `m` | cycle artists, genres, styles, moods, labels, playlists, rated |
+| `x` | play something at random |
+| `X` | shuffle the whole library, without end |
+| `a` | add the selection to a playlist |
 | `1`–`5` | rate the track, `0` clears it |
 | `L` | lyrics |
-| `V` `z` `v` | change visualisation, hide it, open the GPU window |
+| `V` `z` | change visualisation, hide it |
 | `+` `-` | volume |
 | `?` | every key |
 | `q` | quit |

@@ -47,6 +47,8 @@ public final class Player: NSObject {
     private var index = 0
     private var audioTap: AudioTap?
     private var tapAttached = false
+    /// Fires if an item never becomes ready. See `startReadinessWatchdog`.
+    private var readinessWatchdog: DispatchWorkItem?
     private var currentItem: AVPlayerItem?
 
     private var timeObserver: Any?
@@ -167,7 +169,11 @@ public final class Player: NSObject {
     public func seek(to seconds: Double) {
         onMain {
             let time = CMTime(seconds: max(0, seconds), preferredTimescale: 600)
-            self.avPlayer.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { _ in
+            self.avPlayer.seek(
+                to: time,
+                toleranceBefore: PlaybackAsset.seekTolerance,
+                toleranceAfter: PlaybackAsset.seekTolerance
+            ) { _ in
                 self.publish()
             }
         }
@@ -300,12 +306,7 @@ public final class Player: NSObject {
 
         teardownCurrentItem()
 
-        // `AVURLAsset` rather than `AVPlayerItem(url:)` so the audio tap can be
-        // attached to a concrete track once the asset reports one.
-        let asset = AVURLAsset(
-            url: url,
-            options: [AVURLAssetPreferPreciseDurationAndTimingKey: true]
-        )
+        let asset = PlaybackAsset.make(url: url)
         let item = AVPlayerItem(asset: asset)
         // A larger buffer than the default: Plex over WAN stalls otherwise, and a
         // stall is the one thing that breaks the "instant" feel.
@@ -313,6 +314,7 @@ public final class Player: NSObject {
         currentItem = item
 
         observe(item: item)
+        startReadinessWatchdog(for: item, track: track)
         avPlayer.replaceCurrentItem(with: item)
 
         analyzer.reset()
@@ -332,6 +334,32 @@ public final class Player: NSObject {
         updateNowPlaying()
         publish()
         onTrackChange?(track)
+    }
+
+    /// Reports an item that never becomes ready.
+    ///
+    /// `.failed` is observed and surfaced, but an item can also sit in
+    /// `.unknown` indefinitely — a request that hangs, or an asset the player
+    /// cannot finish parsing. Nothing fired then, so a track sat at 0:00 in
+    /// silence with no error, which is indistinguishable from hum ignoring the
+    /// keypress. Asking for precise duration on remote FLAC did exactly this
+    /// for a whole library.
+    ///
+    /// Reports rather than skipping: advancing would walk the queue in silence,
+    /// and the reader can press `n` themselves.
+    private func startReadinessWatchdog(for item: AVPlayerItem, track: Track) {
+        readinessWatchdog?.cancel()
+        let work = DispatchWorkItem { [weak self, weak item] in
+            guard let self, let item, self.currentItem === item else { return }
+            guard item.status == .unknown else { return }
+            self.setError("“\(track.title)” did not start. The server may be busy.")
+            self.stateLock.withLock { self._state.isBuffering = false }
+            self.publish()
+        }
+        readinessWatchdog = work
+        // Long enough not to fire on a slow connection, short enough that
+        // nobody sits watching a still clock wondering whether it is broken.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: work)
     }
 
     /// Prepares the spectrum tap for an item. Attachment happens once the item
@@ -364,6 +392,8 @@ public final class Player: NSObject {
     }
 
     private func teardownCurrentItem() {
+        readinessWatchdog?.cancel()
+        readinessWatchdog = nil
         statusObservation?.invalidate()
         bufferObservation?.invalidate()
         statusObservation = nil
@@ -421,6 +451,8 @@ public final class Player: NSObject {
                 let message = item.error?.localizedDescription ?? "Playback failed."
                 self.setError(message)
             case .readyToPlay:
+                self.readinessWatchdog?.cancel()
+                self.readinessWatchdog = nil
                 // The player has parsed the asset by now, so the tap can be
                 // attached without a second network read.
                 self.attachTapIfReady(item)

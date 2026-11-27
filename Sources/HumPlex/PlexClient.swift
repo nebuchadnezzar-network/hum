@@ -288,6 +288,29 @@ public struct PlexClient: Sendable {
         return (page, total)
     }
 
+    /// One page of tracks from a whole library.
+    ///
+    /// Sorted, and the sort matters: this exists so a caller can read a window
+    /// at a random offset, and an unstable order would make an offset mean
+    /// nothing between requests.
+    public func tracksPage(
+        in section: LibrarySection,
+        start: Int,
+        size: Int,
+        on server: PlexServer
+    ) async throws -> (tracks: [Track], total: Int) {
+        let envelope = try await get(
+            path: "/library/sections/\(section.id)/all",
+            query: ["type": "10", "sort": "titleSort:asc"],
+            start: start,
+            size: size,
+            on: server
+        )
+        let page = (envelope.container.metadata ?? []).compactMap(\.asTrack)
+        let total = envelope.container.totalSize ?? (start + page.count)
+        return (page, total)
+    }
+
     public func artists(in section: LibrarySection, on server: PlexServer) async throws -> [Artist] {
         try await getPaged(
             path: "/library/sections/\(section.id)/all",
@@ -415,8 +438,14 @@ public struct PlexClient: Sendable {
             .filter { ($0.userRating ?? 0) > 0 }
     }
 
-    /// Genres, moods, styles and labels all come back as `Directory` lists from the
-    /// same shaped endpoint, so one function covers the lot.
+    /// Genres, moods, styles and labels all come back as `Directory` lists from
+    /// the same shaped endpoint, so one function covers the lot.
+    ///
+    /// The name and the filter value are read through `displayName` and
+    /// `facetValue` rather than from `title`/`key` directly: a facet listing
+    /// does not use the same field names as a section listing, and reading the
+    /// section names here returned an empty list for every facet — the
+    /// genres, styles, moods and labels panes were simply blank.
     public func facet(
         _ facet: String,
         in section: LibrarySection,
@@ -424,10 +453,87 @@ public struct PlexClient: Sendable {
     ) async throws -> [LibrarySection] {
         let envelope = try await get(path: "/library/sections/\(section.id)/\(facet)", on: server)
         return (envelope.container.directories ?? []).compactMap { directory in
-            guard let key = directory.key, let title = directory.title else { return nil }
-            return LibrarySection(id: key, title: title, type: facet)
+            guard let value = directory.facetValue, let name = directory.displayName else {
+                return nil
+            }
+            return LibrarySection(id: value, title: name, type: facet)
         }
     }
+
+    /// A write, returning the decoded body where there is one.
+    ///
+    /// `rate(ratingKey:rating:on:)` hand-rolled this first; a second and third
+    /// caller made it worth naming. Non-2xx is an error carrying the status and
+    /// the start of the body, because Plex explains refusals in the body and a
+    /// bare status code is not enough to tell a bad URI from a missing
+    /// permission.
+    private func write(
+        method: String,
+        path: String,
+        query: [String: String],
+        on server: PlexServer
+    ) async throws -> PlexEnvelope? {
+        var request = try self.request(path: path, query: query, on: server)
+        request.httpMethod = method
+        request.timeoutInterval = 15
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw PlexError.badResponse(status: -1, body: "")
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            throw PlexError.badResponse(
+                status: http.statusCode,
+                body: String(data: data.prefix(200), encoding: .utf8) ?? ""
+            )
+        }
+        // A write need not return a body, and an empty one is not a failure.
+        guard !data.isEmpty else { return nil }
+        return try? JSONDecoder().decode(PlexEnvelope.self, from: data)
+    }
+
+    /// Adds an item to an existing playlist.
+    ///
+    /// `PUT /playlists/{id}/items`, documented as:
+    ///
+    /// > With a dumb playlist, this adds the specified items to the playlist.
+    ///
+    /// A rating key is enough whether it names a track, an album or an artist:
+    /// the server expands a container into its tracks. "Dumb" means a normal
+    /// playlist — on a smart one the same call replaces the rules instead, so
+    /// this refuses anything whose `smart` flag is set.
+    ///
+    /// Returns the playlist's new track count where the server reports one.
+    @discardableResult
+    public func addToPlaylist(
+        _ playlistID: String,
+        ratingKey: String,
+        in section: LibrarySection,
+        on server: PlexServer
+    ) async throws -> Int? {
+        guard let uri = section.contentURI(forRatingKey: ratingKey) else {
+            throw PlexError.badResponse(
+                status: -1,
+                body: "this library has no UUID, so a playlist URI cannot be built"
+            )
+        }
+        let envelope = try await write(
+            method: "PUT",
+            path: "/playlists/\(playlistID)/items",
+            query: ["uri": uri],
+            on: server
+        )
+        // The documented response is the playlist, whose leafCount is its track
+        // count. Absent on servers that return an empty body.
+        return envelope?.container.allMetadata.first?.leafCount
+    }
+
+    // No createPlaylist. `POST /playlists` is documented with exactly two
+    // parameters — `uri` and `playQueueID` — and no `title` or `type`, so
+    // creating one would mean inventing the parameters that name it. `smart`
+    // appears in the specification only as a filter on `listPlaylists`.
+    // Adding to a playlist that exists is fully documented, including the URI
+    // format, so that is what hum does.
 
     /// Full metadata for a single track, streams included.
     ///

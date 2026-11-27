@@ -8,12 +8,11 @@ Sources/
 ├── HumTUI/          terminal: raw mode, cell-diff renderer, input, widgets
 ├── HumPlex/         plex.tv auth, server discovery, library API, Keychain
 ├── HumPlayer/       AVPlayer queue, media keys, audio tap, FFT
-├── HumVisualizer/   optional Metal spectrum window
 └── hum/             CLI entry, app wiring, the three-pane browser
 ```
 
-Dependencies point one way: `hum` → everything; `HumVisualizer` → `HumPlayer` →
-`HumPlex`; `HumTUI` depends on nothing but Foundation. Nothing below `hum` knows
+Dependencies point one way: `hum` → everything; `HumPlayer` → `HumPlex`;
+`HumTUI` depends on nothing but Foundation. Nothing below `hum` knows
 about layout or key bindings.
 
 ## Threading
@@ -732,8 +731,8 @@ ssh) would otherwise report CJK titles as single-width and shear the grid.
 ```
 AVPlayer ──decode──▶ MTAudioProcessingTap ──samples──▶ SpectrumAnalyzer
    │                   (audio thread)                      │
-   └──▶ speakers                                           ├──▶ TUI block bars
-                                                           └──▶ Metal window
+   └──▶ speakers                                           └──▶ TUI block bars
+                                                                and oscilloscope
 ```
 
 The tap reads the signal AVPlayer is *already* decoding, post-effects, so the

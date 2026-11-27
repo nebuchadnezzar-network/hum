@@ -38,14 +38,14 @@ class Hum < Formula
   # Add `revision:` to pin the exact commit — homebrew-core requires it; a
   # personal tap does not, and a signed tag is already immutable.
   url "https://github.com/nebuchadnezzar-network/hum.git",
-      tag: "v0.1.9"
+      tag: "v0.1.10"
   # Matches the LICENSE file. "-or-later" is the FSF's own recommended
   # boilerplate ("version 3 ... or (at your option) any later version");
   # change to "GPL-3.0-only" to pin it to exactly version 3.
   license "GPL-3.0-or-later"
   head "https://github.com/nebuchadnezzar-network/hum.git", branch: "main"
 
-  # macOS only: AVFoundation, Metal, MPRemoteCommandCenter.
+  # macOS only: AVFoundation, MPRemoteCommandCenter, Keychain.
   depends_on :macos
 
   # The minimum version goes in a block. A bare `depends_on :macos` beside a

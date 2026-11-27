@@ -67,7 +67,7 @@ public struct DeviceInfo: Sendable {
     }
 }
 
-public let humVersion = "0.1.9"
+public let humVersion = "0.1.10"
 
 public enum PlexError: Error, LocalizedError {
     case badResponse(status: Int, body: String)

@@ -43,8 +43,8 @@ private func runBrowser(demo: Bool = false) -> Never {
     let browser = BrowserScreen(app: app, terminal: terminal, artwork: artwork)
 
     // The main thread belongs to AppKit: MPRemoteCommandCenter (media keys),
-    // MPNowPlayingInfoCenter, AVPlayer and Metal all want a main run loop. The
-    // TUI therefore gets its own thread.
+    // MPNowPlayingInfoCenter and AVPlayer all want a main run loop. The TUI
+    // therefore gets its own thread.
     //
     // `.accessory` keeps hum out of the Dock and the ⌘-Tab switcher while still
     // allowing a window — it is a terminal program that happens to be able to
@@ -109,6 +109,15 @@ case "lyrics":
         preferences: Preferences.load(),
         query: arguments.dropFirst().joined(separator: " ")
     ))
+
+case "stream":
+    exit(Diagnostics.dumpStream(
+        preferences: Preferences.load(),
+        query: arguments.dropFirst().joined(separator: " ")
+    ))
+
+case "tags":
+    exit(Diagnostics.dumpTags(preferences: Preferences.load()))
 
 case "servers":
     CLI.listServers(preferences: Preferences.load())

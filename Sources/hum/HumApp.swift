@@ -3,10 +3,21 @@ import Foundation
 import HumPlayer
 import HumPlex
 import HumTUI
-import HumVisualizer
 
 /// What the leftmost pane is listing. Artists are the default; the facets cover
-/// the README's "genres, tags, labels" by filtering albums server-side.
+/// genres, styles, moods and labels by filtering albums server-side.
+///
+/// Which facets exist is a property of the *metadata type*, not of the
+/// library. From the specification, on a `Filter`'s `key`:
+///
+/// > This provides the endpoint where the possible range of values for the
+/// > filter can be retrieved [...] This will include a `type` argument that
+/// > matches the metadata type of the Type element.
+///
+/// So `label` filters albums (type 9) but not tracks (type 10) — and these
+/// facets narrow albums, which is why it belongs here. This list is still
+/// hardcoded, which is the remaining guess: `hum tags` reports the server's
+/// own `Meta.Type[].Filter[]` so it can be driven from that instead.
 enum CollectionMode: CaseIterable {
     case artists, genres, styles, moods, labels, playlists, rated
 
@@ -35,6 +46,53 @@ enum CollectionMode: CaseIterable {
         }
     }
 
+    /// The singular noun, for prompts like "press ⏎ on a genre".
+    var singular: String {
+        switch self {
+        case .artists: return "artist"
+        case .genres: return "genre"
+        case .styles: return "style"
+        case .moods: return "mood"
+        case .labels: return "label"
+        case .playlists: return "playlist"
+        case .rated: return "track"
+        }
+    }
+
+    /// What the leftmost pane says when it has nothing.
+    ///
+    /// Naming the mode rather than saying "nothing here": an empty pane is the
+    /// signal that a facet is unsupported or returned nothing, and "no moods"
+    /// says that where "nothing here" hides it.
+    var collectionsEmptyMessage: String {
+        "no \(title)"
+    }
+
+    /// What the albums pane says when it has nothing.
+    ///
+    /// "nothing here" was shown whenever the pane was empty, which read as "this
+    /// library has no albums" at the exact moment the truth was "pick something
+    /// on the left first". A facet mode does not load albums until a value is
+    /// chosen, so the pane is empty by design right after `m`.
+    func albumsEmptyMessage(hasCollections: Bool, isSearching: Bool) -> String {
+        if isSearching { return "no matching albums" }
+        if isFlat { return "\(title) go straight to tracks" }
+        if !hasCollections { return collectionsEmptyMessage }
+        // Artists load their albums as the cursor moves, so an empty pane there
+        // is a real answer rather than a missing step.
+        if facet == nil { return "no albums" }
+        return "press ⏎ on a \(singular)"
+    }
+
+    /// What the tracks pane says when it has nothing.
+    func tracksEmptyMessage(hasCollections: Bool, hasAlbums: Bool, isSearching: Bool) -> String {
+        if isSearching { return "no matching tracks" }
+        if !hasCollections { return collectionsEmptyMessage }
+        if isFlat { return "press ⏎ on a \(singular)" }
+        if !hasAlbums { return albumsEmptyMessage(hasCollections: hasCollections, isSearching: isSearching) }
+        return "press ⏎ on an album"
+    }
+
     /// The Plex facet endpoint and filter name. Nil for artists, which are items
     /// rather than a facet.
     var facet: String? {
@@ -54,12 +112,37 @@ enum CollectionMode: CaseIterable {
     }
 }
 
+/// Where `x` landed: the whole three-pane state plus what to play.
+///
+/// One value rather than a sequence of load events, because a random landing is
+/// atomic — the panes, the selections and the track that starts all describe the
+/// same choice, and posting them separately would show the reader three
+/// unrelated jumps while the next request was still in flight.
+struct Landing {
+    var mode: CollectionMode
+    var collections: [CollectionItem]
+    var collectionIndex: Int
+    var albums: [Album]
+    var albumIndex: Int?
+    var tracks: [Track]
+    var trackIndex: Int
+
+    var describedChoice: String {
+        guard collections.indices.contains(collectionIndex) else { return mode.title }
+        let chosen = collections[collectionIndex].title
+        // "rated tracks" already names itself; "track · rated tracks" does not
+        // read as anything.
+        guard mode != .rated else { return chosen }
+        return "\(mode.singular) · \(chosen)"
+    }
+}
+
+
 /// Owns the Plex connection, the player and all the async loading. Knows nothing
 /// about layout or key handling — it only posts events for the UI thread to apply.
 final class HumApp {
     let events = EventQueue()
     let player = Player()
-    let visualizer: VisualizerWindow
 
     private(set) var client: PlexClient
     private(set) var server: PlexServer?
@@ -138,7 +221,6 @@ final class HumApp {
         self.preferences = preferences
         let device = DeviceInfo(clientIdentifier: preferences.clientIdentifier)
         self.client = PlexClient(device: device, token: token)
-        self.visualizer = VisualizerWindow(analyzer: player.analyzer)
         self.demo = demoMode
             ? DemoLibrary(events: events)
             : nil
@@ -188,6 +270,7 @@ final class HumApp {
 
         player.onStateChange = { [weak self] state in
             self?.events.post(.playback(state))
+            self?.topUpShuffleAll(state)
         }
 
         // Tell the server what we're playing so Plex's own clients stay in sync.
@@ -417,6 +500,299 @@ final class HumApp {
 
     func collectionsSettled() { collectionsInFlight = false }
 
+    // MARK: - Playlists
+
+    /// Fetches the audio playlists, for the picker behind `a`.
+    ///
+    /// Deliberately not cached: a playlist added from a phone a minute ago
+    /// should be in the list, and this runs only when the reader asks.
+    func loadPlaylistChoices() {
+        if demo != nil {
+            events.post(.status("demo mode cannot write to a server", isError: true))
+            return
+        }
+        guard let server else { return }
+        Task { [self] in
+            do {
+                let playlists = try await client.audioPlaylists(on: server)
+                guard !playlists.isEmpty else {
+                    // hum cannot create one — `POST /playlists` is documented
+                    // without the parameters that would name it — so say where
+                    // to make one rather than offering an empty list.
+                    events.post(.status(
+                        "no playlists yet — make one in a Plex client first",
+                        isError: true
+                    ))
+                    return
+                }
+                events.post(.playlistChoices(playlists.map { list in
+                    CollectionItem(id: list.id, title: list.title, detail: list.count.map { "\($0)" })
+                }))
+            } catch {
+                events.post(.status(error.localizedDescription, isError: true))
+            }
+        }
+    }
+
+    /// Adds one item — a track, an album or an artist — to a playlist.
+    ///
+    /// A rating key is all the server needs for any of the three: it expands a
+    /// container into its tracks.
+    func addToPlaylist(
+        _ playlistID: String,
+        playlistTitle: String,
+        ratingKey: String,
+        describing label: String,
+        section: LibrarySection
+    ) {
+        guard let server else { return }
+        Task { [self] in
+            do {
+                let count = try await client.addToPlaylist(
+                    playlistID, ratingKey: ratingKey, in: section, on: server
+                )
+                let tail = count.map { " (\($0) tracks)" } ?? ""
+                events.post(.status("added \(label) to \(playlistTitle)\(tail)", isError: false))
+            } catch {
+                events.post(.status("could not add: \(error.localizedDescription)", isError: true))
+            }
+        }
+    }
+
+    // MARK: - Shuffle all
+
+    /// The library a random mix is being drawn from, or nil when not shuffling
+    /// everything. Also the flag that keeps the mix topped up.
+    private var shuffleAllSection: LibrarySection?
+    private var shuffleAllTotal = 0
+    private var shuffleAllTopUpInFlight = false
+
+    /// Tracks per batch, and how few may remain before another is fetched.
+    ///
+    /// 24 is a few minutes of listening, so the top-up happens while something
+    /// is playing rather than between tracks; 6 remaining is enough runway that
+    /// a slow request does not end the music.
+    private static let shuffleBatch = 24
+    private static let shuffleRunway = 6
+    /// Tracks per request. A batch read one at a time is 24 requests.
+    private static let shuffleWindow = 8
+
+    /// Plays a random mix of the whole library, topped up as it goes.
+    ///
+    /// Shuffle on `s` reorders the queue you have; this one has no end.
+    func shuffleAll(section: LibrarySection) {
+        if let demo {
+            // Every demo track, in one go — the whole library is in memory and
+            // there is nothing to page.
+            var all: [Track] = []
+            for item in demo.collections(mode: .artists) {
+                for album in demo.albums(for: item, mode: .artists) {
+                    all.append(contentsOf: demo.tracks(albumID: album.id))
+                }
+            }
+            all.shuffle()
+            guard !all.isEmpty else {
+                events.post(.status("nothing to shuffle", isError: true))
+                return
+            }
+            events.post(.shuffleAll(tracks: all, replacing: true))
+            return
+        }
+
+        guard let server else { return }
+        events.post(.status("gathering a random mix…", isError: false))
+        Task { [self] in
+            do {
+                // A page of one, only to learn totalSize.
+                let head = try await client.tracksPage(in: section, start: 0, size: 1, on: server)
+                guard head.total > 0 else {
+                    events.post(.status("no tracks in this library", isError: true))
+                    return
+                }
+                shuffleAllTotal = head.total
+                let mix = try await randomTracks(section: section, on: server)
+                guard !mix.isEmpty else {
+                    events.post(.status("could not draw a mix", isError: true))
+                    return
+                }
+                shuffleAllSection = section
+                events.post(.shuffleAll(tracks: mix, replacing: true))
+            } catch {
+                events.post(.status(error.localizedDescription, isError: true))
+            }
+        }
+    }
+
+    /// Re-arms the mix after `play` cleared it.
+    ///
+    /// Starting the mix goes through `play`, which clears the flag because
+    /// choosing something is how you normally leave a random mix. The caller
+    /// that *is* the mix says so with this.
+    func resumeShuffleAll(section: LibrarySection) {
+        shuffleAllSection = section
+    }
+
+    /// Reads a few windows at random offsets and shuffles what comes back.
+    private func randomTracks(
+        section: LibrarySection,
+        on server: PlexServer
+    ) async throws -> [Track] {
+        let offsets = ShuffleOffsets.pick(
+            total: shuffleAllTotal,
+            window: Self.shuffleWindow,
+            count: Self.shuffleBatch
+        )
+        var picked: [Track] = []
+        var seen = Set<String>()
+        for start in offsets {
+            let page = try await client.tracksPage(
+                in: section, start: start, size: Self.shuffleWindow, on: server
+            )
+            for track in page.tracks where !seen.contains(track.id) {
+                seen.insert(track.id)
+                picked.append(track)
+            }
+        }
+        picked.shuffle()
+        return picked
+    }
+
+    /// Adds another batch when the mix is running out.
+    ///
+    /// Driven from playback rather than a timer: the only thing that consumes
+    /// the queue is tracks finishing.
+    private func topUpShuffleAll(_ state: PlaybackState) {
+        guard let section = shuffleAllSection, let server else { return }
+        guard !shuffleAllTopUpInFlight else { return }
+        guard state.queueCount - state.queueIndex <= Self.shuffleRunway else { return }
+        shuffleAllTopUpInFlight = true
+        Task { [self] in
+            defer { shuffleAllTopUpInFlight = false }
+            do {
+                let more = try await randomTracks(section: section, on: server)
+                guard !more.isEmpty else { return }
+                events.post(.shuffleAll(tracks: more, replacing: false))
+            } catch {
+                // A failed top-up is not worth interrupting the music for; the
+                // next track finishing will try again.
+            }
+        }
+    }
+
+    // MARK: - Random
+
+    /// Picks a mode, a value within it, an album and a track — all at random —
+    /// and starts playing.
+    ///
+    /// Modes are tried in shuffled order and a mode that yields nothing is
+    /// skipped, so this works on a library with no moods, no playlists and
+    /// nothing rated as long as *something* is there. Each step is a plain
+    /// `await` rather than the event-posting loaders: the panes should jump once,
+    /// to a finished choice, not three times as the requests land.
+    func surpriseMe(section: LibrarySection) {
+        if let demo {
+            let modes = CollectionMode.allCases.shuffled()
+            for mode in modes {
+                let items = demo.collections(mode: mode)
+                guard let index = items.indices.randomElement() else { continue }
+                let pick = items[index]
+                if mode.isFlat {
+                    let tracks = demo.flatTracks(for: pick.id)
+                    guard let track = tracks.indices.randomElement() else { continue }
+                    events.post(.landed(Landing(
+                        mode: mode, collections: items, collectionIndex: index,
+                        albums: [], albumIndex: nil, tracks: tracks, trackIndex: track
+                    )))
+                    return
+                }
+                let albums = demo.albums(for: pick, mode: mode)
+                guard let albumIndex = albums.indices.randomElement() else { continue }
+                let tracks = demo.tracks(albumID: albums[albumIndex].id)
+                guard let track = tracks.indices.randomElement() else { continue }
+                events.post(.landed(Landing(
+                    mode: mode, collections: items, collectionIndex: index,
+                    albums: albums, albumIndex: albumIndex, tracks: tracks, trackIndex: track
+                )))
+                return
+            }
+            events.post(.status("nothing to play", isError: true))
+            return
+        }
+
+        guard let server else { return }
+        events.post(.status("finding something…", isError: false))
+        Task { [self] in
+            for mode in CollectionMode.allCases.shuffled() {
+                do {
+                    if let landing = try await land(in: mode, section: section, on: server) {
+                        events.post(.landed(landing))
+                        return
+                    }
+                } catch {
+                    // A mode that errors is a mode this server does not support
+                    // — an unsupported facet is the whole reason for trying
+                    // several. Keep going rather than reporting it.
+                    continue
+                }
+            }
+            events.post(.status("found nothing to play", isError: true))
+        }
+    }
+
+    private func land(
+        in mode: CollectionMode,
+        section: LibrarySection,
+        on server: PlexServer
+    ) async throws -> Landing? {
+        let items: [CollectionItem]
+        switch mode {
+        case .artists:
+            let page = try await client.artistsPage(
+                in: section, start: 0, size: Self.collectionPageSize, on: server
+            )
+            items = page.artists.map(Self.collectionItem)
+        case .playlists:
+            items = try await client.audioPlaylists(on: server).map { list in
+                CollectionItem(id: list.id, title: list.title, detail: list.count.map { "\($0)" })
+            }
+        case .rated:
+            items = [CollectionItem(id: Self.ratedCollectionID, title: "rated tracks", detail: nil)]
+        case .genres, .styles, .moods, .labels:
+            guard let facet = mode.facet else { return nil }
+            items = try await client.facet(facet, in: section, on: server)
+                .map { CollectionItem(id: $0.id, title: $0.title, detail: nil) }
+        }
+        guard let index = items.indices.randomElement() else { return nil }
+        let pick = items[index]
+
+        if mode.isFlat {
+            let tracks = mode == .rated
+                ? try await client.ratedTracks(in: section, on: server)
+                : try await client.playlistTracks(pick.id, on: server)
+            guard let track = tracks.indices.randomElement() else { return nil }
+            return Landing(
+                mode: mode, collections: items, collectionIndex: index,
+                albums: [], albumIndex: nil, tracks: tracks, trackIndex: track
+            )
+        }
+
+        let albums: [Album]
+        if let facet = mode.facet {
+            albums = try await client.albums(
+                in: section, facet: facet, facetID: pick.id, on: server
+            )
+        } else {
+            albums = try await client.albums(ofArtist: pick.id, on: server)
+        }
+        guard let albumIndex = albums.indices.randomElement() else { return nil }
+        let tracks = try await client.tracks(ofAlbum: albums[albumIndex].id, on: server)
+        guard let track = tracks.indices.randomElement() else { return nil }
+        return Landing(
+            mode: mode, collections: items, collectionIndex: index,
+            albums: albums, albumIndex: albumIndex, tracks: tracks, trackIndex: track
+        )
+    }
+
     func loadCollections(section: LibrarySection, mode: CollectionMode) {
         if let demo {
             events.post(.sectionLoaded(sectionID: section.id, collections: demo.collections(mode: mode)))
@@ -479,7 +855,7 @@ final class HumApp {
                     return
                 }
                 guard generation == loadGeneration else { return }
-                // Facets are short lists — genres, labels — and arrive whole.
+                // Facets are short lists — genres, moods — and arrive whole.
                 collectionTotal = items.count
                 collectionSection = section.id
                 events.post(.sectionLoaded(sectionID: section.id, collections: items))
@@ -741,6 +1117,9 @@ final class HumApp {
     // needing to know which it is talking to.
 
     func play(_ tracks: [Track], startingAt index: Int) {
+        // Choosing something is leaving the random mix. Without this, a queue
+        // the reader picked would keep growing with random tracks behind it.
+        shuffleAllSection = nil
         player.play(tracks, startingAt: index)
     }
 
@@ -774,23 +1153,5 @@ final class HumApp {
 
     func toggleRepeat() {
         player.toggleRepeat()
-    }
-
-    // MARK: - Visualizer
-
-    /// Must be called on the main thread; the UI thread hops for us.
-    func toggleVisualizer() {
-        DispatchQueue.main.async { [self] in
-            if let message = visualizer.toggle() {
-                events.post(.status(message, isError: true))
-            } else {
-                events.post(.status(
-                    visualizer.isVisible ? "visualizer open" : "visualizer closed",
-                    isError: false
-                ))
-                // The window steals focus; hand it back so typing keeps working.
-                if visualizer.isVisible { NSApp.activate(ignoringOtherApps: false) }
-            }
-        }
     }
 }

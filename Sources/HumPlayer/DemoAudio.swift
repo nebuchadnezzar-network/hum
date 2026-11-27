@@ -64,10 +64,26 @@ public enum DemoAudio {
         let frames = Int(sampleRate * max(1, min(seconds, 600)))
         var random = SplitMix64(seed: seed)
 
-        // A minor pentatonic rooted somewhere comfortable.
-        let root = 110.0 * pow(2.0, Double(random.next(upTo: 5)) / 12.0)
-        let steps = [0.0, 3.0, 5.0, 7.0, 10.0, 12.0]
-        let noteLength = 0.28 + Double(random.next(upTo: 3)) * 0.06
+        // A pentatonic rooted somewhere comfortable, over two octaves.
+        //
+        // The root used to move across five semitones, 110-138Hz, and every
+        // other component here is a multiple of it — so two tracks differed by
+        // a few Hz at the bottom and drew the same spectrum, differing in 4 of
+        // 64 bars. Pentatonic either way, so a hash-chosen sequence cannot land
+        // on something sour; minor or major is the seed's choice.
+        let root = 55.0 * pow(2.0, Double(random.next(upTo: 25)) / 12.0)
+        let minor = [0.0, 3.0, 5.0, 7.0, 10.0, 12.0]
+        let major = [0.0, 2.0, 4.0, 7.0, 9.0, 12.0]
+        let steps = random.next(upTo: 2) == 0 ? minor : major
+        let noteLength = 0.22 + Double(random.next(upTo: 5)) * 0.06
+
+        // How much of the upper partials survives. A dull track and a bright
+        // one occupy visibly different parts of the band.
+        let brightness = 0.35 + Double(random.next(upTo: 100)) / 100.0 * 0.9
+        // The sweep's rate and where it sits, so the moving part of the picture
+        // is not identical between tracks either.
+        let sweepRate = 0.02 + Double(random.next(upTo: 7)) * 0.01
+        let sweepBase = 5.0 + Double(random.next(upTo: 9))
 
         var samples = [Int16]()
         samples.reserveCapacity(frames)
@@ -91,12 +107,14 @@ public enum DemoAudio {
             // Three partials, falling away — enough spread for the analyser to
             // draw something across the band rather than one spike.
             value += envelope * 0.22 * sin(2 * .pi * note * t)
-            value += envelope * 0.09 * sin(2 * .pi * note * 2 * t)
-            value += envelope * 0.04 * sin(2 * .pi * note * 3 * t)
+            value += envelope * 0.09 * brightness * sin(2 * .pi * note * 2 * t)
+            value += envelope * 0.04 * brightness * sin(2 * .pi * note * 3 * t)
+            value += envelope * 0.02 * brightness * brightness * sin(2 * .pi * note * 5 * t)
 
             // A slow sweep so the picture keeps changing while a track plays.
-            let sweep = 0.5 + 0.5 * sin(2 * .pi * 0.03 * t)
-            value += 0.05 * sweep * sin(2 * .pi * (root * 8 + root * 6 * sweep) * t)
+            let sweep = 0.5 + 0.5 * sin(2 * .pi * sweepRate * t)
+            value += 0.05 * sweep
+                * sin(2 * .pi * (root * sweepBase + root * sweepBase * 0.75 * sweep) * t)
 
             // Fade the first and last half-second: a hard start clicks, and
             // the click is the loudest thing in the spectrum when it happens.

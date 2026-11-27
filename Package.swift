@@ -16,10 +16,9 @@ let package = Package(
         .target(name: "HumTUI", swiftSettings: v5),
         .target(name: "HumPlex", swiftSettings: v5),
         .target(name: "HumPlayer", dependencies: ["HumPlex"], swiftSettings: v5),
-        .target(name: "HumVisualizer", dependencies: ["HumPlayer"], swiftSettings: v5),
         .executableTarget(
             name: "hum",
-            dependencies: ["HumTUI", "HumPlex", "HumPlayer", "HumVisualizer"],
+            dependencies: ["HumTUI", "HumPlex", "HumPlayer"],
             swiftSettings: v5
         ),
     ]

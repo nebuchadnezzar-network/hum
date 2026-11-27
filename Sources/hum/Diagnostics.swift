@@ -1,4 +1,6 @@
+import AVFoundation
 import Foundation
+import HumPlayer
 import HumPlex
 import HumTUI
 
@@ -227,6 +229,452 @@ extension Diagnostics {
     /// this server expose lyrics at all? Plex carries them as a stream of type 4
     /// inside `Media > Part > Stream`, and if nothing in the library has one then
     /// no amount of client work will produce lyrics.
+    /// Reports why a track will not play.
+    ///
+    /// Browsing uses hum's own URLSession; playback hands a URL to AVPlayer,
+    /// which makes its own connection with its own TLS, App Transport Security
+    /// and codec rules. So "the library loads but nothing plays" is normal
+    /// enough to need its own report, and the symptom worth separating is a
+    /// stall from a failure: the player sets an error message when an item
+    /// reaches `.failed`, and shows nothing at all when the item sits in
+    /// `.unknown` forever because the request is hanging.
+    ///
+    /// Three answers, in order: does the track carry a part to stream, what
+    /// does the server say to a plain HTTP request for it, and what does
+    /// AVPlayer make of the same URL.
+    static func dumpStream(preferences: Preferences, query: String?) -> Int32 {
+        guard let token = CLI.ensureToken(preferences: preferences) else { return 1 }
+        let device = DeviceInfo(clientIdentifier: preferences.clientIdentifier)
+        let client = PlexClient(device: device, token: token)
+
+        func log(_ line: String = "") { print(line) }
+        log("hum \(humVersion) stream report")
+        log()
+
+        let server: PlexServer
+        let track: Track
+        do {
+            server = try CLI.blocking { try await client.bestServer() }
+            log("server     \(server.name)")
+            // The scheme and host matter: App Transport Security refuses plain
+            // HTTP by default from inside a bundle, and a relay connection is
+            // bandwidth-capped in a way that looks like stalling.
+            log("connection \(server.baseURL.scheme ?? "?")://\(server.baseURL.host ?? "?")"
+                + ":\(server.baseURL.port.map(String.init) ?? "")"
+                + "  \(server.isRelay ? "relay" : (server.isLocal ? "local" : "remote"))")
+
+            let sections = try CLI.blocking { try await client.musicSections(on: server) }
+            guard let section = sections.first else {
+                CLI.failure("no music libraries on this server")
+                return 1
+            }
+
+            var found: Track?
+            if let query, !query.isEmpty {
+                found = try CLI.blocking { try await client.search(query, on: server) }.tracks.first
+            } else {
+                // Several albums, and the first track that carries stream data
+                // with a real title. Picking album one, track one found an
+                // untitled file by an unknown artist — plausibly damaged, and a
+                // damaged file tells you nothing about whether playback works.
+                let albums = try CLI.blocking { try await client.albums(in: section, limit: 5, on: server) }
+                for album in albums {
+                    let tracks = try CLI.blocking {
+                        try await client.tracks(ofAlbum: album.id, on: server)
+                    }
+                    if let candidate = tracks.first(where: {
+                        $0.partKey != nil && $0.title != "(untitled)"
+                    }) {
+                        found = candidate
+                        break
+                    }
+                    if found == nil { found = tracks.first }
+                }
+            }
+            guard let first = found else {
+                CLI.failure("no track found to test")
+                return 1
+            }
+            track = first
+        } catch {
+            CLI.failure("\(error)")
+            return 1
+        }
+
+        log()
+        log("track      \(track.title) — \(track.artist)")
+        log("ratingKey  \(track.id)")
+        log("partKey    \(track.partKey ?? "MISSING — nothing to stream")")
+        log()
+
+        // Enrichment: /children does not reliably carry Part data on every
+        // server, so a track can arrive unplayable and become playable after a
+        // second call. Worth knowing which one this is.
+        if track.partKey == nil {
+            log("The track has no part, so hum would report “No playable media”.")
+            log("Trying the per-track endpoint, which is where hum gets it from:")
+            if let enriched = try? CLI.blocking({
+                try await client.trackDetails(id: track.id, on: server)
+            }) ?? nil {
+                log("  partKey  \(enriched.partKey ?? "still missing")")
+            } else {
+                log("  that call failed too")
+            }
+            return 0
+        }
+
+        let url: URL
+        do {
+            url = try client.streamURL(for: track, on: server)
+        } catch {
+            log("stream URL could not be built: \(error.localizedDescription)")
+            return 1
+        }
+        // The token is in the query string, and this report is meant to be
+        // pasted somewhere.
+        var shown = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        let redacted = shown?.queryItems?.map {
+            $0.name == "X-Plex-Token" ? URLQueryItem(name: $0.name, value: "REDACTED") : $0
+        }
+        shown?.queryItems = redacted
+        log("stream URL \(shown?.url?.absoluteString ?? "?")")
+        log()
+
+        // What the server says, asking the way any HTTP client would.
+        log("plain request for the first 64KB")
+        var request = URLRequest(url: url)
+        request.setValue("bytes=0-65535", forHTTPHeaderField: "Range")
+        request.timeoutInterval = 20
+        let semaphore = DispatchSemaphore(value: 0)
+        var summary = "no response"
+        PlexSession.shared.dataTask(with: request) { data, response, error in
+            if let error {
+                summary = "failed: \(error.localizedDescription)"
+            } else if let http = response as? HTTPURLResponse {
+                let type = http.value(forHTTPHeaderField: "Content-Type") ?? "?"
+                let length = http.value(forHTTPHeaderField: "Content-Length") ?? "?"
+                summary = "status \(http.statusCode), \(type), Content-Length \(length)"
+                    + ", \(data?.count ?? 0) bytes received"
+            }
+            semaphore.signal()
+        }.resume()
+        _ = semaphore.wait(timeout: .now() + 25)
+        log("  \(summary)")
+
+        // Without a Range header, so the server reports the whole file. A
+        // zero-length or truncated file is "Cannot Open" too, and looks like a
+        // player fault until you see the size.
+        var whole = URLRequest(url: url)
+        whole.httpMethod = "HEAD"
+        whole.timeoutInterval = 20
+        let headDone = DispatchSemaphore(value: 0)
+        var headSummary = "no response"
+        PlexSession.shared.dataTask(with: whole) { _, response, error in
+            if let error {
+                headSummary = "failed: \(error.localizedDescription)"
+            } else if let http = response as? HTTPURLResponse {
+                headSummary = "status \(http.statusCode)"
+                    + ", Content-Length \(http.value(forHTTPHeaderField: "Content-Length") ?? "?")"
+                    + ", Accept-Ranges \(http.value(forHTTPHeaderField: "Accept-Ranges") ?? "none")"
+            }
+            headDone.signal()
+        }.resume()
+        _ = headDone.wait(timeout: .now() + 25)
+        log("  whole file: \(headSummary)")
+        log()
+
+        // And what AVPlayer makes of it, which is the part hum actually uses.
+        log("AVPlayer, 12 seconds")
+        let item = AVPlayerItem(url: url)
+        let player = AVPlayer(playerItem: item)
+        player.volume = 0
+        player.play()
+        let deadline = Date().addingTimeInterval(12)
+        var lastStatus = -1
+        while Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.25))
+            if item.status.rawValue != lastStatus {
+                lastStatus = item.status.rawValue
+                let name = ["unknown", "readyToPlay", "failed"][min(lastStatus, 2)]
+                log("  status      \(name)")
+                if let error = item.error {
+                    log("  error       \(error.localizedDescription)")
+                    // "Cannot Open" is AVFoundation's wording for several
+                    // different faults; the domain and code separate them, and
+                    // the underlying error is usually the specific one.
+                    let detail = error as NSError
+                    log("  domain      \(detail.domain) \(detail.code)")
+                    if let underlying = detail.userInfo[NSUnderlyingErrorKey] as? NSError {
+                        log("  underlying  \(underlying.domain) \(underlying.code)"
+                            + "  \(underlying.localizedDescription)")
+                    }
+                    if let reason = detail.localizedFailureReason {
+                        log("  reason      \(reason)")
+                    }
+                }
+            }
+            if item.status == .failed { break }
+        }
+        log("  time        \(String(format: "%.1f", item.currentTime().seconds))s played")
+        log("  keep up     \(item.isPlaybackLikelyToKeepUp)")
+        if let log_ = item.errorLog(), !log_.events.isEmpty {
+            log("  error log")
+            for event in log_.events.prefix(4) {
+                log("    \(event.errorStatusCode) \(event.errorComment ?? "")")
+            }
+        }
+        player.pause()
+
+        log()
+
+        // The same URL through `PlaybackAsset.make`, which is what the player
+        // uses — shared rather than copied, because when the diagnostic built
+        // its asset differently it called a URL playable that hum could not
+        // play. This is the comparison that found
+        // AVURLAssetPreferPreciseDurationAndTimingKey stalling a FLAC library.
+        log("AVPlayer again, built the way hum builds it, 12 seconds")
+        let humItem = AVPlayerItem(asset: PlaybackAsset.make(url: url))
+        humItem.preferredForwardBufferDuration = 10
+        let humPlayer = AVPlayer(playerItem: humItem)
+        humPlayer.volume = 0
+        humPlayer.play()
+        let humDeadline = Date().addingTimeInterval(12)
+        var humLast = -1
+        while Date() < humDeadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.25))
+            if humItem.status.rawValue != humLast {
+                humLast = humItem.status.rawValue
+                log("  status      \(["unknown", "readyToPlay", "failed"][min(humLast, 2)])")
+                if let error = humItem.error {
+                    let detail = error as NSError
+                    log("  error       \(error.localizedDescription)")
+                    log("  domain      \(detail.domain) \(detail.code)")
+                }
+            }
+            if humItem.status == .failed { break }
+        }
+        log("  time        \(String(format: "%.1f", humItem.currentTime().seconds))s played")
+        log("  keep up     \(humItem.isPlaybackLikelyToKeepUp)")
+        log()
+
+        if item.status == .readyToPlay, humItem.status != .readyToPlay {
+            log("The plain item played and hum's did not, with the same URL — so")
+            log("this is hum's asset options, not the server or the network.")
+            log("AVURLAssetPreferPreciseDurationAndTimingKey is the suspect.")
+        } else if item.status == .readyToPlay, humItem.currentTime().seconds == 0 {
+            log("Both became ready, but hum's played nothing — the difference is")
+            log("in starting playback rather than in opening the asset.")
+        }
+
+        if item.status == .readyToPlay, item.currentTime().seconds > 0 {
+            log("Plain AVPlayer played this URL, so the stream path is working.")
+        } else if item.status == .unknown {
+            log("The item never became ready and never failed — the request is")
+            log("hanging rather than being refused. Compare the plain request")
+            log("above: a 200 there with a stall here points at AVPlayer's own")
+            log("connection, not at the URL.")
+        }
+        return 0
+    }
+
+    /// Reports what the server returns for each tag facet.
+    ///
+    /// The facet panes — genres, styles, moods, labels — read `Directory`
+    /// entries from `/library/sections/{id}/{facet}`, and a facet listing does
+    /// not use the same field names as a section listing. The specification
+    /// documents `tag`/`id`/`filter` for `/label` and `/tags`, and documents no
+    /// `/genre`, `/mood` or `/style` path at all, so what any given server
+    /// sends has to be looked at rather than assumed.
+    ///
+    /// This prints the raw field names alongside what hum derives from them,
+    /// then filters albums by the first facet it found — so a blank pane can be
+    /// told apart from an endpoint that is not there.
+    static func dumpTags(preferences: Preferences) -> Int32 {
+        guard let token = CLI.ensureToken(preferences: preferences) else { return 1 }
+        let device = DeviceInfo(clientIdentifier: preferences.clientIdentifier)
+        let client = PlexClient(device: device, token: token)
+
+        var requests = 0
+        func log(_ line: String = "") { print(line) }
+
+        log("hum \(humVersion) tag report")
+        log()
+
+        let server: PlexServer
+        let section: LibrarySection
+        do {
+            server = try CLI.blocking { try await client.bestServer() }
+            requests += 1
+            log("server   \(server.name)")
+            let sections = try CLI.blocking { try await client.musicSections(on: server) }
+            requests += 1
+            guard let first = sections.first else {
+                CLI.failure("no music libraries on this server")
+                return 1
+            }
+            section = first
+            log("library  \(section.title)  (id \(section.id))")
+            log()
+        } catch {
+            CLI.failure("\(error)")
+            return 1
+        }
+
+        // The authoritative answer to "which facets exist", and it is per
+        // metadata type rather than per library. From the specification, on a
+        // Filter's `key`:
+        //
+        //   This provides the endpoint where the possible range of values for
+        //   the filter can be retrieved [...] This will include a `type`
+        //   argument that matches the metadata type of the Type element.
+        //
+        // Which is why `label` filters albums but not tracks. `includeMeta=1`
+        // adds the Meta object carrying these, so the list below comes from the
+        // server rather than from a hardcoded guess.
+        for (label, type) in [("albums", "9"), ("tracks", "10")] {
+            log("filters for \(label) (type \(type))")
+            do {
+                let response = try CLI.blocking {
+                    try await client.raw(
+                        path: "/library/sections/\(section.id)/all",
+                        query: ["type": type, "includeMeta": "1", "X-Plex-Container-Size": "0"],
+                        on: server
+                    )
+                }
+                requests += 1
+                log("  status      \(response.status), \(response.body.count) bytes")
+                guard response.status == 200,
+                      let object = try? JSONSerialization.jsonObject(with: response.body) as? [String: Any],
+                      let container = object["MediaContainer"] as? [String: Any] else { continue }
+                guard let meta = container["Meta"] as? [String: Any] else {
+                    log("  Meta        absent — this server ignored includeMeta=1")
+                    continue
+                }
+                let types = meta["Type"] as? [[String: Any]] ?? []
+                for entry in types {
+                    let filters = entry["Filter"] as? [[String: Any]] ?? []
+                    let name = entry["title"] as? String ?? entry["type"] as? String ?? "?"
+                    log("  \(name): \(filters.count) filter(s)")
+                    for filter in filters {
+                        let key = filter["filter"] as? String ?? "?"
+                        let title = filter["title"] as? String ?? "?"
+                        let kind = filter["filterType"] as? String ?? ""
+                        log("    \(key.padding(toLength: max(key.count, 14), withPad: " ", startingAt: 0)) \(title)\(kind.isEmpty ? "" : "  [\(kind)]")")
+                    }
+                }
+            } catch {
+                log("  failed      \(error)")
+            }
+            log()
+        }
+
+        var firstUsable: (facet: String, value: String, name: String)?
+
+        // `label` is probed although it is no longer a browse mode: confirming
+        // it stays empty for music is the point, and a server that does support
+        // it would show up here.
+        for facet in ["genre", "mood", "style", "label"] {
+            log("/library/sections/\(section.id)/\(facet)")
+            do {
+                let response = try CLI.blocking {
+                    try await client.raw(path: "/library/sections/\(section.id)/\(facet)", on: server)
+                }
+                requests += 1
+                log("  status      \(response.status), \(response.body.count) bytes")
+                if response.status == 200,
+                   let object = try? JSONSerialization.jsonObject(with: response.body) as? [String: Any],
+                   let container = object["MediaContainer"] as? [String: Any] {
+                    let entries = container["Directory"] as? [[String: Any]] ?? []
+                    log("  entries     \(entries.count)")
+                    if let sample = entries.first {
+                        log("  fields      \(sample.keys.sorted().joined(separator: ", "))")
+                        log("  sample      \(describe(sample))")
+                    }
+                }
+            } catch {
+                log("  failed      \(error)")
+            }
+
+            // The real code path, so the pane's contents are not inferred.
+            do {
+                let derived = try CLI.blocking { try await client.facet(facet, in: section, on: server) }
+                requests += 1
+                log("  hum reads   \(derived.count) item(s)")
+                if let sample = derived.first {
+                    log("  first       \(sample.title) -> ?\(facet)=\(sample.id)")
+                    if firstUsable == nil {
+                        firstUsable = (facet, sample.id, sample.title)
+                    }
+                } else {
+                    log("  first       none — this pane would be blank")
+                }
+            } catch {
+                log("  hum reads   failed: \(error)")
+            }
+            log()
+        }
+
+        // Documented, admin-only, and returns every tag type at once with a
+        // `tagType` to tell them apart. Worth knowing whether it is available
+        // as a fallback for whichever per-facet paths a server lacks.
+        log("/library/sections/\(section.id)/tags")
+        do {
+            let response = try CLI.blocking {
+                try await client.raw(path: "/library/sections/\(section.id)/tags", on: server)
+            }
+            requests += 1
+            log("  status      \(response.status), \(response.body.count) bytes")
+            if response.status == 200,
+               let object = try? JSONSerialization.jsonObject(with: response.body) as? [String: Any],
+               let container = object["MediaContainer"] as? [String: Any] {
+                let entries = container["Directory"] as? [[String: Any]] ?? []
+                var byType: [String: Int] = [:]
+                for entry in entries {
+                    byType["\(entry["tagType"] ?? "none")", default: 0] += 1
+                }
+                log("  entries     \(entries.count)")
+                log("  tagType     \(byType.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value)" }.joined(separator: ", "))")
+            }
+        } catch {
+            log("  failed      \(error)")
+        }
+        log()
+
+        // End to end: a facet value is only useful if filtering by it returns
+        // something. A pane that fills and then shows no albums is the same
+        // bug one step later.
+        if let usable = firstUsable {
+            log("albums where \(usable.facet)=\(usable.value)  (\(usable.name))")
+            do {
+                let albums = try CLI.blocking {
+                    try await client.albums(
+                        in: section,
+                        facet: usable.facet,
+                        facetID: usable.value,
+                        limit: 5,
+                        on: server
+                    )
+                }
+                requests += 1
+                log("  albums      \(albums.count)")
+                for album in albums.prefix(5) {
+                    log("              \(album.title) — \(album.artist ?? "?")")
+                }
+                if albums.isEmpty {
+                    log("              none — the value is not what this filter expects")
+                }
+            } catch {
+                log("  failed      \(error)")
+            }
+        } else {
+            log("no facet returned a usable value, so filtering was not tried")
+        }
+
+        log()
+        log("\(requests) requests made.")
+        return 0
+    }
+
     static func dumpLyrics(preferences: Preferences, query: String?) -> Int32 {
         guard let token = CLI.ensureToken(preferences: preferences) else { return 1 }
         let device = DeviceInfo(clientIdentifier: preferences.clientIdentifier)

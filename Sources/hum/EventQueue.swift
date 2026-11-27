@@ -30,6 +30,13 @@ enum Event {
         retryable: Bool = false
     )
     case searchResults(query: String, results: SearchResults)
+    /// A random landing: replaces all three panes and starts playing.
+    case landed(Landing)
+    /// Playlists fetched for the "add to playlist" picker.
+    case playlistChoices([CollectionItem])
+    /// A random mix drawn from the whole library. `replacing` distinguishes
+    /// starting one from topping up the one already playing.
+    case shuffleAll(tracks: [Track], replacing: Bool)
     /// A browse request finished, successfully or not, and is no longer on the
     /// wire. Keeps the in-flight bookkeeping on the UI thread.
     /// A track's rating changed — optimistically, or reverted after a refusal.

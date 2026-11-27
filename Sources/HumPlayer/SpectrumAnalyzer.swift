@@ -14,19 +14,21 @@ import Foundation
 ///  3. **Present** (any thread) — resamples those bands to whatever width the
 ///     caller wants.
 ///
-/// The rate limit and the lock are both load-bearing: the inline TUI bars and the
-/// Metal window are two independent consumers at different widths and frame
-/// rates. Without the lock they corrupt the shared scratch buffers; without the
-/// rate limit the smoothing runs at the *sum* of their frame rates and the bars
-/// visibly snap.
+/// The rate limit and the lock are both load-bearing. The compute path runs on
+/// the audio thread while the present path runs on the UI thread, and the
+/// spectrum panel and the oscilloscope ask at different widths: without the
+/// lock they corrupt the shared scratch buffers, and without the rate limit the
+/// smoothing runs at the sum of the callers' frame rates and the bars visibly
+/// snap. A GPU window was once a third consumer, which is how the corruption
+/// was found; the constraint did not leave with it.
 public final class SpectrumAnalyzer {
     /// 1024 samples at 44.1kHz is ~23ms — fast enough to feel locked to the beat,
     /// long enough for ~43Hz bins at the bottom end.
     public static let fftSize = 1024
     private static let log2n = vDSP_Length(10)  // log2(1024)
 
-    /// Internal resolution. Wider than any terminal and wider than the Metal
-    /// window's bar count, so every consumer is downsampling.
+    /// Internal resolution, fixed and wider than any terminal, so presenting is
+    /// always a downsample and never an interpolation up.
     private static let bandCount = 256
 
     /// ~120Hz ceiling on recomputation. Cheaper than the fastest consumer asks

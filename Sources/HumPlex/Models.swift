@@ -66,6 +66,40 @@ struct PlexDirectory: Decodable {
     var title: String?
     var uuid: String?
     var agent: String?
+    // Facet listings — /library/sections/{id}/genre and friends — return a
+    // differently shaped Directory from section listings: the name arrives as
+    // `tag` rather than `title`, and the value to filter on as `id` or as a
+    // ready-made `filter` fragment rather than `key`. The specification
+    // documents only the second shape, for /label and /tags; servers have been
+    // seen emitting the first. Decoding both costs four optionals.
+    var tag: String?
+    var id: Int?
+    var filter: String?
+    var tagType: Int?
+
+    /// What this directory is called, whichever shape it arrived in.
+    var displayName: String? {
+        for candidate in [title, tag] {
+            if let candidate, !candidate.trimmingCharacters(in: .whitespaces).isEmpty {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    /// The value to send back as `?genre=…` when filtering on this facet.
+    ///
+    /// `filter` is preferred where present because the server composed it —
+    /// it arrives as a fragment like `genre=123`, and the part after the last
+    /// `=` is the value. Otherwise `key`, then `id`.
+    var facetValue: String? {
+        if let filter, let separator = filter.lastIndex(of: "=") {
+            let value = filter[filter.index(after: separator)...]
+            if !value.isEmpty { return String(value) }
+        }
+        if let key, !key.isEmpty { return key }
+        return id.map(String.init)
+    }
 }
 
 struct PlexMetadata: Decodable {
@@ -170,14 +204,41 @@ public struct LibrarySection: Identifiable, Hashable, Sendable {
     /// Plex's section type: "artist" for music, "movie"/"show" for video. hum
     /// only browses music, so `musicSections(on:)` filters on `isMusic`.
     public let type: String
+    /// The section's UUID, needed to build a playlist content URI. Absent on
+    /// the facet listings, which reuse this type for genre and mood values.
+    public let uuid: String?
 
-    public init(id: String, title: String, type: String) {
+    public init(id: String, title: String, type: String, uuid: String? = nil) {
         self.id = id
         self.title = title
         self.type = type
+        self.uuid = uuid
     }
 
     public var isMusic: Bool { type == "artist" }
+
+    /// The content URI for an item in this section.
+    ///
+    /// From the specification, on `uri`:
+    ///
+    /// > Format is `library://<section-uuid>/item/<url-encoded-key>`
+    ///
+    /// with the documented example
+    /// `library://82503060-0d68-4603-b594-8b071d54819e/item/%2Flibrary%2Fmetadata%2F146`
+    /// — so the key is `/library/metadata/<ratingKey>`, percent-encoded whole,
+    /// slashes included.
+    ///
+    /// Returns nil without a UUID rather than composing a URI the server will
+    /// reject: this is the input to a write, and a malformed one would either
+    /// fail opaquely or touch the wrong thing.
+    public func contentURI(forRatingKey ratingKey: String) -> String? {
+        guard let uuid, !uuid.isEmpty, !ratingKey.isEmpty else { return nil }
+        // Only unreserved characters survive, so `/` becomes %2F as documented.
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
+        guard let encoded = "/library/metadata/\(ratingKey)"
+            .addingPercentEncoding(withAllowedCharacters: allowed) else { return nil }
+        return "library://\(uuid)/item/\(encoded)"
+    }
 }
 
 public struct Artist: Identifiable, Hashable, Sendable {
@@ -331,7 +392,7 @@ public struct Track: Identifiable, Hashable, Sendable {
 extension PlexDirectory {
     var asLibrarySection: LibrarySection? {
         guard let key, let title else { return nil }
-        return LibrarySection(id: key, title: title, type: type ?? "unknown")
+        return LibrarySection(id: key, title: title, type: type ?? "unknown", uuid: uuid)
     }
 }
 
